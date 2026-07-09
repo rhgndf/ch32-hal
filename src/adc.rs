@@ -82,6 +82,53 @@ pub struct Adc<'d, T: Instance, MODE = Blocking> {
     _mode: PhantomData<MODE>,
 }
 
+/// Continuous ADC stream backed by circular DMA.
+pub struct AdcStream<'d, T: Instance> {
+    ring: crate::dma::ReadableRingBuffer<'d, u16>,
+    _adc: PhantomData<&'d mut T>,
+}
+
+impl<'d, T: Instance> AdcStream<'d, T> {
+    /// Clear the unread samples from the stream buffer.
+    pub fn clear(&mut self) {
+        self.ring.clear();
+    }
+
+    /// Read available samples into `buf`.
+    pub fn read(&mut self, buf: &mut [u16]) -> Result<(usize, usize), crate::dma::OverrunError> {
+        self.ring.read(buf)
+    }
+
+    /// Read exactly `buf.len()` samples.
+    pub async fn read_exact(&mut self, buf: &mut [u16]) -> Result<usize, crate::dma::OverrunError> {
+        self.ring.read_exact(buf).await
+    }
+
+    /// The capacity of the stream buffer.
+    pub const fn capacity(&self) -> usize {
+        self.ring.capacity()
+    }
+
+    /// Stop continuous conversion and DMA streaming.
+    pub async fn stop(&mut self) {
+        self.ring.stop().await;
+        Self::stop_adc();
+    }
+
+    fn stop_adc() {
+        T::regs().ctlr2().modify(|w| {
+            w.set_dma(false);
+            w.set_cont(false);
+        });
+    }
+}
+
+impl<'d, T: Instance> Drop for AdcStream<'d, T> {
+    fn drop(&mut self) {
+        Self::stop_adc();
+    }
+}
+
 impl<'d, T: Instance, MODE> Adc<'d, T, MODE> {
     fn new_inner(adc: Peri<'d, T>, config: Config) -> Self {
         T::enable_and_reset();
@@ -236,6 +283,62 @@ impl<'d, T: Instance, MODE> Adc<'d, T, MODE> {
 
         T::regs().rdatar().read().data()
     }
+
+    fn start_stream_inner<'a>(&'a mut self, dma: Peri<'a, impl AdcDma<T>>, buffer: &'a mut [u16]) -> AdcStream<'a, T> {
+        if T::regs().statr().read().eoc() {
+            let _ = T::regs().rdatar().read().data();
+        }
+
+        let request = dma.request();
+        let options = crate::dma::TransferOptions {
+            circular: true,
+            half_transfer_ir: true,
+            complete_transfer_ir: true,
+            ..Default::default()
+        };
+
+        let mut ring = unsafe {
+            crate::dma::ReadableRingBuffer::new(dma, request, T::regs().rdatar().as_ptr() as *mut u16, buffer, options)
+        };
+
+        T::regs().ctlr2().modify(|w| {
+            w.set_dma(true);
+            w.set_cont(true);
+        });
+
+        ring.start();
+        T::regs().ctlr2().modify(|w| w.set_swstart(true));
+
+        AdcStream {
+            ring,
+            _adc: PhantomData,
+        }
+    }
+
+    #[cfg(adc_v3)]
+    pub fn start_stream<'a>(
+        &'a mut self,
+        channel: &mut impl AdcChannel<T>,
+        sample_time: SampleTime,
+        pga: Pga,
+        dma: Peri<'a, impl AdcDma<T>>,
+        buffer: &'a mut [u16],
+    ) -> AdcStream<'a, T> {
+        self.configure_channel(channel, 1, sample_time, pga);
+        self.start_stream_inner(dma, buffer)
+    }
+
+    #[cfg(not(adc_v3))]
+    pub fn start_stream<'a>(
+        &'a mut self,
+        channel: &mut impl AdcChannel<T>,
+        sample_time: SampleTime,
+        dma: Peri<'a, impl AdcDma<T>>,
+        buffer: &'a mut [u16],
+    ) -> AdcStream<'a, T> {
+        self.configure_channel(channel, 1, sample_time);
+        self.start_stream_inner(dma, buffer)
+    }
 }
 
 impl<'d, T: Instance> Adc<'d, T, Blocking> {
@@ -329,6 +432,8 @@ pub trait AdcChannel<T: Instance>: SealedAdcChannel<T> + Sized {
         }
     }
 }
+
+dma_trait!(AdcDma, Instance);
 
 /// A type-erased channel for a given ADC instance.
 ///
