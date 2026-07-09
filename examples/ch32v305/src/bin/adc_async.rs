@@ -78,18 +78,25 @@ async fn main(_spawner: Spawner) {
 
     let usb_fut = usb.run();
     let stream_fut = async {
-        let mut samples = [0u16; 64];
-
         loop {
             let mut sum = 0u32;
             let mut count = 0u32;
             let mut report = core::pin::pin!(Timer::after(Duration::from_millis(100)));
 
             loop {
-                match select(stream.read_exact(&mut samples), &mut report).await {
-                    Either::First(Ok(_remaining)) => {
-                        sum += samples.iter().copied().map(u32::from).sum::<u32>();
-                        count += samples.len() as u32;
+                match select(
+                    stream.read_half(|samples| {
+                        samples.iter().fold((0u32, 0u32), |(sum, count), sample| {
+                            (sum + u32::from(sample), count + 1)
+                        })
+                    }),
+                    &mut report,
+                )
+                .await
+                {
+                    Either::First(Ok((half_sum, half_count))) => {
+                        sum += half_sum;
+                        count += half_count;
                     }
                     Either::First(Err(_)) => {
                         stream.clear();

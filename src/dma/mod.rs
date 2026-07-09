@@ -20,7 +20,7 @@ mod util;
 pub(crate) use util::*;
 
 pub(crate) mod ringbuffer;
-pub use ringbuffer::OverrunError;
+pub use ringbuffer::{OverrunError, ReadableDmaHalf};
 
 /// "No DMA" placeholder.
 ///

@@ -1,6 +1,7 @@
 #![cfg_attr(gpdma, allow(unused))]
 
 use core::future::poll_fn;
+use core::marker::PhantomData;
 use core::ops::Range;
 use core::sync::atomic::{compiler_fence, Ordering};
 use core::task::{Poll, Waker};
@@ -35,6 +36,85 @@ pub struct ReadableDmaRingBuffer<'a, W: Word> {
     pub(crate) dma_buf: &'a mut [W],
     start: usize,
 }
+
+/// A readable half of a circular DMA buffer.
+///
+/// Values are read with volatile loads because the memory is owned by the DMA
+/// controller while streaming is active.
+pub struct ReadableDmaHalf<'a, W: Word> {
+    ptr: *const W,
+    len: usize,
+    _phantom: PhantomData<&'a W>,
+}
+
+impl<'a, W: Word> ReadableDmaHalf<'a, W> {
+    pub(crate) fn new(ptr: *const W, len: usize) -> Self {
+        Self {
+            ptr,
+            len,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Number of elements in this half-buffer.
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Returns true if this half-buffer is empty.
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Read one element from this half-buffer.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index` is out of bounds.
+    pub fn read(&self, index: usize) -> W {
+        assert!(index < self.len);
+        unsafe { core::ptr::read_volatile(self.ptr.add(index)) }
+    }
+
+    /// Iterate over this half-buffer with volatile reads.
+    pub fn iter(&self) -> ReadableDmaHalfIter<'_, W> {
+        ReadableDmaHalfIter {
+            ptr: self.ptr,
+            index: 0,
+            len: self.len,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+/// Iterator over a readable half of a circular DMA buffer.
+pub struct ReadableDmaHalfIter<'a, W: Word> {
+    ptr: *const W,
+    index: usize,
+    len: usize,
+    _phantom: PhantomData<&'a W>,
+}
+
+impl<'a, W: Word> Iterator for ReadableDmaHalfIter<'a, W> {
+    type Item = W;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index == self.len {
+            None
+        } else {
+            let value = unsafe { core::ptr::read_volatile(self.ptr.add(self.index)) };
+            self.index += 1;
+            Some(value)
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<'a, W: Word> ExactSizeIterator for ReadableDmaHalfIter<'a, W> {}
 
 #[derive(Debug, PartialEq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -71,6 +151,13 @@ impl<'a, W: Word> ReadableDmaRingBuffer<'a, W> {
     /// The capacity of the ringbuffer
     pub const fn cap(&self) -> usize {
         self.dma_buf.len()
+    }
+
+    pub(crate) fn half(&self, index: usize) -> ReadableDmaHalf<'_, W> {
+        debug_assert!(index < 2);
+        let half_len = self.cap() / 2;
+        let start = index * half_len;
+        ReadableDmaHalf::new(unsafe { self.dma_buf.as_ptr().add(start) }, half_len)
     }
 
     /// The current position of the ringbuffer

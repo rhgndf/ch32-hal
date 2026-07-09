@@ -5,7 +5,7 @@ use core::task::{Context, Poll, Waker};
 
 use embassy_sync::waitqueue::AtomicWaker;
 
-use super::ringbuffer::{DmaCtrl, OverrunError, ReadableDmaRingBuffer, WritableDmaRingBuffer};
+use super::ringbuffer::{DmaCtrl, OverrunError, ReadableDmaHalf, ReadableDmaRingBuffer, WritableDmaRingBuffer};
 use super::word::{Word, WordSize};
 use super::{AnyChannel, Channel, Dir, Request, STATE};
 use crate::interrupt::typelevel::Interrupt;
@@ -104,12 +104,14 @@ mod bdma_only {
 pub(crate) struct ChannelState {
     waker: AtomicWaker,
     complete_count: AtomicUsize,
+    half_count: AtomicUsize,
 }
 
 impl ChannelState {
     pub(crate) const NEW: Self = Self {
         waker: AtomicWaker::new(),
         complete_count: AtomicUsize::new(0),
+        half_count: AtomicUsize::new(0),
     };
 }
 
@@ -138,10 +140,19 @@ impl AnyChannel {
                     panic!("DMA: error on BDMA@{:08x} channel {}", r.as_ptr() as u32, info.num);
                 }
 
+                let mut wake = false;
+
                 if isr.htif(info.num) && cr.read().htie() {
                     // Acknowledge half transfer complete interrupt
                     r.ifcr().write(|w| w.set_htif(info.num, true));
-                } else if isr.tcif(info.num) && cr.read().tcie() {
+                    critical_section::with(|_| {
+                        let cnt = state.half_count.load(Ordering::Acquire);
+                        state.half_count.store(cnt + 1, Ordering::Release);
+                    });
+                    wake = true;
+                }
+
+                if isr.tcif(info.num) && cr.read().tcie() {
                     // Acknowledge transfer complete interrupt
                     r.ifcr().write(|w| w.set_tcif(info.num, true));
                     critical_section::with(|_| {
@@ -149,8 +160,13 @@ impl AnyChannel {
                         // no interruption
                         let cnt = state.complete_count.load(Ordering::Acquire);
                         state.complete_count.store(cnt + 1, Ordering::Release);
+                        let cnt = state.half_count.load(Ordering::Acquire);
+                        state.half_count.store(cnt + 1, Ordering::Release);
                     });
-                } else {
+                    wake = true;
+                }
+
+                if !wake {
                     return;
                 }
 
@@ -180,6 +196,7 @@ impl AnyChannel {
                 let ch = r.ch(info.num);
 
                 state.complete_count.store(0, Ordering::Release);
+                state.half_count.store(0, Ordering::Release);
                 self.clear_irqs();
 
                 ch.par().write_value(peri_addr as u32); // PADDR
@@ -256,6 +273,10 @@ impl AnyChannel {
         match self.info().dma {
             DmaInfo::Dma(r) => r.ch(info.num).ndtr().read().ndt(),
         }
+    }
+
+    fn get_half_count(&self) -> usize {
+        STATE[self.id as usize].half_count.load(Ordering::Acquire)
     }
 
     fn disable_circular_mode(&self) {
@@ -485,6 +506,7 @@ impl<'a> DmaCtrl for DmaCtrlImpl<'a> {
 pub struct ReadableRingBuffer<'a, W: Word> {
     channel: Peri<'a, AnyChannel>,
     ringbuf: ReadableDmaRingBuffer<'a, W>,
+    half_read_count: usize,
 }
 
 impl<'a, W: Word> ReadableRingBuffer<'a, W> {
@@ -504,6 +526,7 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
         let data_size = W::size();
 
         options.complete_transfer_ir = true;
+        options.half_transfer_ir = true;
         options.circular = true;
 
         channel.configure(
@@ -520,6 +543,7 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
         Self {
             channel,
             ringbuf: ReadableDmaRingBuffer::new(buffer),
+            half_read_count: 0,
         }
     }
 
@@ -533,6 +557,7 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
     /// Clear all data in the ring buffer.
     pub fn clear(&mut self) {
         self.ringbuf.clear(&mut DmaCtrlImpl(self.channel.reborrow()));
+        self.half_read_count = self.channel.get_half_count();
     }
 
     /// Read elements from the ring buffer
@@ -559,6 +584,56 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
         self.ringbuf
             .read_exact(&mut DmaCtrlImpl(self.channel.reborrow()), buffer)
             .await
+    }
+
+    /// Read the next completed half of the circular DMA buffer in place.
+    ///
+    /// The closure receives a view that reads values with volatile loads. The
+    /// returned value is discarded if the DMA writer reaches this half again
+    /// before the closure returns.
+    pub async fn read_half<R>(&mut self, f: impl FnOnce(ReadableDmaHalf<'_, W>) -> R) -> Result<R, OverrunError> {
+        assert!(self.capacity() >= 2);
+        assert!(self.capacity() % 2 == 0);
+
+        poll_fn(|cx| {
+            self.set_waker(cx.waker());
+
+            compiler_fence(Ordering::SeqCst);
+
+            let half_count = self.channel.get_half_count();
+            let available = half_count.saturating_sub(self.half_read_count);
+
+            if available == 0 {
+                Poll::Pending
+            } else if available > 1 {
+                Poll::Ready(Err(OverrunError))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        })
+        .await?;
+
+        let half_index = self.half_read_count % 2;
+        let result = f(self.ringbuf.half(half_index));
+
+        compiler_fence(Ordering::SeqCst);
+
+        let half_count = self.channel.get_half_count();
+        let pos = self.ringbuf.cap() - self.channel.get_remaining_transfers() as usize;
+        let half_len = self.ringbuf.cap() / 2;
+
+        let overrun = half_count != self.half_read_count + 1
+            || match half_index {
+                0 => pos < half_len,
+                _ => pos >= half_len,
+            };
+
+        if overrun {
+            Err(OverrunError)
+        } else {
+            self.half_read_count += 1;
+            Ok(result)
+        }
     }
 
     /// The capacity of the ringbuffer

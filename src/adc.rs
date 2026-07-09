@@ -104,6 +104,14 @@ impl<'d, T: Instance> AdcStream<'d, T> {
         self.ring.read_exact(buf).await
     }
 
+    /// Read the next completed DMA half-buffer in place.
+    pub async fn read_half<R>(
+        &mut self,
+        f: impl FnOnce(crate::dma::ReadableDmaHalf<'_, u16>) -> R,
+    ) -> Result<R, crate::dma::OverrunError> {
+        self.ring.read_half(f).await
+    }
+
     /// The capacity of the stream buffer.
     pub const fn capacity(&self) -> usize {
         self.ring.capacity()
