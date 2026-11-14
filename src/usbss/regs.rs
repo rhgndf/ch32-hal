@@ -15,7 +15,7 @@ const LINK_HOT_RESET: u8 = 1;
 const UP_STREAM: u32 = 2 << 16;
 const DOWN_STREAM: u32 = 1 << 16;
 
-/// The link partner the controller plays.
+/// Which end of the link the controller is.
 #[derive(Clone, Copy)]
 pub(super) enum Role {
     Device {
@@ -345,8 +345,7 @@ impl Regs {
         self.link_lmp_port_cap().modify(|w| w.set_link_lmp_tx_cap_vld(true));
     }
 
-    /// Stops the training sequences from carrying a Hot Reset the link
-    /// already entered.
+    /// Completes a Hot Reset, which waits for `TX_TS_CFG[0]` to clear.
     pub fn end_hot_reset(self) {
         self.link_ctrl()
             .modify(|w| w.set_link_tx_ts_cfg(w.link_tx_ts_cfg() & !LINK_HOT_RESET));
