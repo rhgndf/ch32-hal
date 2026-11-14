@@ -23,8 +23,6 @@ use core::sync::atomic::{fence, AtomicU8, Ordering};
 
 use crate::pac::rcc::vals::UsbsspllRefsel;
 use crate::pac::usbss::UsbssDevice;
-#[cfg(feature = "embassy")]
-use crate::pac::usbss::UsbssHost;
 use crate::{interrupt, PeripheralType, RccPeripheral};
 
 mod control;
@@ -122,15 +120,13 @@ impl State {
             mode: AtomicU8::new(MODE_DEVICE),
             device: device::State::new(regs::Regs(device)),
             #[cfg(feature = "embassy")]
-            host: host::State::new(),
+            host: host::State::new(regs::Regs(device)),
         }
     }
 }
 
 trait SealedInstance: RccPeripheral {
     fn device() -> UsbssDevice;
-    #[cfg(feature = "embassy")]
-    fn host() -> UsbssHost;
     fn state() -> &'static State;
 }
 
@@ -150,11 +146,6 @@ foreach_peripheral!(
         impl SealedInstance for peripherals::$inst {
             fn device() -> UsbssDevice {
                 unsafe { UsbssDevice::from_ptr(crate::pac::$inst.as_ptr()) }
-            }
-
-            #[cfg(feature = "embassy")]
-            fn host() -> UsbssHost {
-                unsafe { UsbssHost::from_ptr(crate::pac::$inst.as_ptr()) }
             }
 
             fn state() -> &'static State {
@@ -179,7 +170,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
     unsafe fn on_interrupt() {
         if T::state().mode.load(Ordering::Relaxed) == MODE_HOST {
             #[cfg(feature = "embassy")]
-            host::on_interrupt::<T>();
+            T::state().host.on_interrupt();
         } else {
             device::on_interrupt::<T>();
         }
@@ -195,7 +186,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::LinkInterrupt> for LinkInterr
     unsafe fn on_interrupt() {
         if T::state().mode.load(Ordering::Relaxed) == MODE_HOST {
             #[cfg(feature = "embassy")]
-            host::on_link_interrupt::<T>();
+            T::state().host.on_link_interrupt();
         } else {
             device::on_interrupt::<T>();
         }

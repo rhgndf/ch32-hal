@@ -22,10 +22,10 @@ use embassy_usb_driver::host::{
 };
 use embassy_usb_driver::{EndpointInfo, EndpointType, Speed};
 
+use super::regs::{self, Regs};
 use super::{
-    dma_capable, dma_memory, init_clocks, regs, Buffer, Error, Instance, InterruptHandler, LinkInterruptHandler,
-    LinkState, EP0_SIZE, LMP_LINK_SPEED, LMP_PORT_CAP, LMP_PORT_CFG, LMP_PORT_CFG_RES, LMP_SUBTYPE_MASK, MODE_HOST,
-    NUM_HP_BUF,
+    dma_capable, dma_memory, init_clocks, Buffer, Error, Instance, InterruptHandler, LinkInterruptHandler, LinkState,
+    EP0_SIZE, LMP_LINK_SPEED, LMP_PORT_CAP, LMP_PORT_CFG, LMP_PORT_CFG_RES, LMP_SUBTYPE_MASK, MODE_HOST, NUM_HP_BUF,
 };
 use crate::internal::drop::OnDrop;
 use crate::interrupt::typelevel::{Binding, Interrupt};
@@ -55,6 +55,7 @@ const STATUS_DELAY: Duration = Duration::from_millis(1);
 const DOWN_STREAM: u32 = 1 << 16;
 
 pub(super) struct State {
+    regs: Regs,
     /// Held while a transaction is armed.
     engine: Mutex<CriticalSectionRawMutex, ()>,
     done: AtomicWaker,
@@ -72,8 +73,9 @@ pub(super) struct State {
 }
 
 impl State {
-    pub const fn new() -> Self {
+    pub const fn new(regs: Regs) -> Self {
         Self {
+            regs,
             engine: Mutex::new(()),
             done: AtomicWaker::new(),
             erdy: AtomicU32::new(0),
@@ -84,207 +86,203 @@ impl State {
             bounce: AtomicUsize::new(0),
         }
     }
+
+    fn bounce(&self) -> Buffer {
+        Buffer {
+            address: self.bounce.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Fails every pipe and wakes everything that waits on the port.
+    fn port_lost(&self) {
+        self.connected.store(false, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.done.wake();
+        wake_all(&self.erdy_wakers);
+        self.port_waker.wake();
+    }
+
+    /// Stops the transaction engine and drops its completion.
+    fn disarm(&self, incoming: bool) {
+        let h = self.regs.host();
+        if incoming {
+            h.uh_rx_ctrl().write(|_| {});
+        } else {
+            h.uh_tx_ctrl().write(|_| {});
+        }
+        h.status().write(|w| w.set_uif_transfer(true));
+    }
+
+    /// Initializes the block as a SuperSpeed host, also on a warm reset. The
+    /// de-emphasis is the 3.5 dB of USB 3.0, where the EVT writes the reserved
+    /// value 3.
+    fn init(&self) {
+        self.port_lost();
+        self.erdy.store(0, Ordering::Relaxed);
+
+        let h = self.regs.host();
+        h.usbss_ctrl().modify(|w| w.set_usb_clr_all(true));
+        h.usbss_ctrl().modify(|w| w.set_usb_clr_all(false));
+        h.uh_tx_ctrl().write(|_| {});
+        h.uh_rx_ctrl().write(|_| {});
+
+        h.link_cfg().write(|w| {
+            w.set_link_rx_eq_en(true);
+            w.set_link_tx_deemph(TxDeemph::DB3_5);
+            w.set_link_down_mode(true);
+            w.set_link_phy_reset(true);
+        });
+        h.link_ctrl().write(|w| {
+            w.set_link_pd_mode(PdMode::P2);
+            w.set_link_go_disabled(true);
+        });
+        h.link_cfg().write(|w| {
+            w.set_link_rx_eq_en(true);
+            w.set_link_tx_deemph(TxDeemph::DB3_5);
+            w.set_link_down_mode(true);
+            w.set_link_u2_det_en(true);
+            w.set_link_ltssm_mode(true);
+        });
+        h.link_lpm_cr().modify(|w| w.set_lpm_en(true));
+
+        // The EVT waits without a bound.
+        for _ in 0..1_000_000 {
+            if !h.link_status().read().link_busy() {
+                break;
+            }
+        }
+
+        h.link_cfg().modify(|w| w.set_link_rx_term_en(true));
+        h.link_int_ctrl().write(|w| {
+            w.set_link_ie_tx_lmp(true);
+            w.set_link_ie_rx_lmp(true);
+            w.set_link_ie_rx_lmp_tout(true);
+            w.set_link_ie_state_chg(true);
+            w.set_link_ie_warm_rst(true);
+        });
+        h.link_ctrl().write(|w| w.set_link_pd_mode(PdMode::P2));
+        h.link_itp_pre().write(|w| w.set_itp_pre(122));
+        h.link_tx_route().write_value(0);
+        h.usbss_ctrl().modify(|w| w.set_force_rst(true));
+
+        // Also releases FORCE_RST.
+        h.usbss_ctrl().write(|w| {
+            w.set_host_mode(true);
+            w.set_itp_en(true);
+            w.set_dma_en(true);
+            w.set_reg_hp_pend(2);
+            w.set_uhie_erdy(true);
+        });
+        h.uh_tx_ctrl().write(|_| {});
+        h.status().write(|w| {
+            w.set_uif_transfer(true);
+            w.set_uhif_erdy(true);
+        });
+
+        // Host mode uses the device view's endpoint enables.
+        self.regs.uep_tx_en().write(|w| w.set_ep_tx_en(0, true));
+        self.regs.uep_rx_en().write(|w| w.set_ep_rx_en(0, true));
+
+        self.regs.phy_tuning();
+    }
+
+    /// GLOBAL interrupt in host mode: records ERDYs and wakes the task of the
+    /// completed transaction, which acknowledges it.
+    pub(super) fn on_interrupt(&self) {
+        let h = self.regs.host();
+        let status = h.status().read();
+
+        if status.uhif_erdy() {
+            let host_status = h.host_status().read();
+            h.status().write(|w| w.set_uhif_erdy(true));
+            let bit = erdy_bit(host_status.uh_rx_erdy_ep(), host_status.uh_rx_erdy_dir());
+            self.erdy.fetch_or(1 << bit, Ordering::AcqRel);
+            self.erdy_wakers[bit].wake();
+        }
+
+        if status.uif_transfer() && h.usbss_ctrl().read().uie_transfer() {
+            // Masked until the task acknowledges it, or it fires again.
+            h.usbss_ctrl().modify(|w| w.set_uie_transfer(false));
+            self.done.wake();
+        }
+    }
+
+    /// LINK interrupt in host mode. A downstream port sends PORT_CAP and
+    /// answers the device's PORT_CAP with PORT_CFG; PORT_CFG_RES means
+    /// training completed.
+    pub(super) fn on_link_interrupt(&self) {
+        let r = self.regs;
+        let flags = r.link_int_flag().read();
+
+        if flags.link_if_state_chg() {
+            r.link_int_flag().write(|w| w.set_link_if_state_chg(true));
+            match r.link_status().read().link_state() {
+                // Release the forced state so the LTSSM re-detects.
+                LinkState::DISABLED => r.link_ctrl().modify(|w| w.set_link_go_disabled(false)),
+                LinkState::RXDET | LinkState::INACTIVE => self.port_lost(),
+                LinkState::HOTRST => {
+                    r.link_ctrl()
+                        .modify(|w| w.set_link_tx_ts_cfg(w.link_tx_ts_cfg() & !regs::LINK_HOT_RESET));
+                }
+                _ => {}
+            }
+        }
+
+        if flags.link_if_tx_lmp() {
+            r.link_int_flag().write(|w| w.set_link_if_tx_lmp(true));
+            r.link_lmp_tx_data(0).write_value(LMP_LINK_SPEED | LMP_PORT_CAP);
+            r.link_lmp_tx_data(1).write_value(DOWN_STREAM | NUM_HP_BUF);
+            r.link_lmp_tx_data(2).write_value(0);
+        }
+
+        if flags.link_if_rx_lmp() {
+            r.link_int_flag().write(|w| w.set_link_if_rx_lmp(true));
+            match r.link_lmp_rx_data(0).read() & LMP_SUBTYPE_MASK {
+                LMP_PORT_CAP => {
+                    r.link_lmp_tx_data(0).write_value(LMP_LINK_SPEED | LMP_PORT_CFG);
+                    r.link_lmp_tx_data(1).write_value(0);
+                    r.link_lmp_tx_data(2).write_value(0);
+                }
+                LMP_PORT_CFG_RES => {
+                    r.link_lmp_port_cap().modify(|w| w.set_link_lmp_tx_cap_vld(true));
+                    self.connected.store(true, Ordering::Release);
+                }
+                _ => {}
+            }
+        }
+
+        if flags.link_if_rx_lmp_tout() {
+            r.link_int_flag().write(|w| w.set_link_if_rx_lmp_tout(true));
+            r.link_ctrl().modify(|w| {
+                w.set_link_go_disabled(true);
+                w.set_link_go_rx_det(true);
+            });
+        }
+
+        if flags.link_if_warm_rst() {
+            r.link_int_flag().write(|w| w.set_link_if_warm_rst(true));
+            if r.link_status().read().link_rx_warm_rst() {
+                self.init();
+            }
+        }
+
+        self.port_waker.wake();
+    }
 }
 
 fn state<T: Instance>() -> &'static State {
     &T::state().host
 }
 
-fn bounce<T: Instance>() -> Buffer {
-    Buffer {
-        address: state::<T>().bounce.load(Ordering::Relaxed),
-    }
-}
-
 fn erdy_bit(endpoint: u8, incoming: bool) -> usize {
     usize::from(endpoint) * 2 + usize::from(incoming)
 }
 
-/// Fails every pipe and wakes everything that waits on the port.
-fn port_lost<T: Instance>() {
-    let state = state::<T>();
-    state.connected.store(false, Ordering::Release);
-    state.generation.fetch_add(1, Ordering::AcqRel);
-    state.done.wake();
-    wake_all(&state.erdy_wakers);
-    state.port_waker.wake();
-}
-
-/// Out of line, so the loop stays a loop rather than 32 inlined wakes.
-#[inline(never)]
+/// Hides the length, or LLVM unrolls the loop into 4 KiB of wakes.
 fn wake_all(wakers: &[AtomicWaker]) {
-    for waker in wakers {
+    for waker in core::hint::black_box(wakers) {
         waker.wake();
     }
-}
-
-/// Stops the transaction engine and drops its completion.
-fn disarm<T: Instance>(incoming: bool) {
-    let h = T::host();
-    if incoming {
-        h.uh_rx_ctrl().write(|_| {});
-    } else {
-        h.uh_tx_ctrl().write(|_| {});
-    }
-    h.status().write(|w| w.set_uif_transfer(true));
-}
-
-/// Initializes the block as a SuperSpeed host, also on a warm reset. The
-/// de-emphasis is the 3.5 dB of USB 3.0, where the EVT writes the reserved
-/// value 3.
-unsafe fn init<T: Instance>() {
-    T::state().mode.store(MODE_HOST, Ordering::Relaxed);
-    port_lost::<T>();
-    state::<T>().erdy.store(0, Ordering::Relaxed);
-
-    let h = T::host();
-    let d = T::device();
-
-    h.usbss_ctrl().modify(|w| w.set_usb_clr_all(true));
-    h.usbss_ctrl().modify(|w| w.set_usb_clr_all(false));
-    h.uh_tx_ctrl().write(|_| {});
-    h.uh_rx_ctrl().write(|_| {});
-
-    h.link_cfg().write(|w| {
-        w.set_link_rx_eq_en(true);
-        w.set_link_tx_deemph(TxDeemph::DB3_5);
-        w.set_link_down_mode(true);
-        w.set_link_phy_reset(true);
-    });
-    h.link_ctrl().write(|w| {
-        w.set_link_pd_mode(PdMode::P2);
-        w.set_link_go_disabled(true);
-    });
-    h.link_cfg().write(|w| {
-        w.set_link_rx_eq_en(true);
-        w.set_link_tx_deemph(TxDeemph::DB3_5);
-        w.set_link_down_mode(true);
-        w.set_link_u2_det_en(true);
-        w.set_link_ltssm_mode(true);
-    });
-    h.link_lpm_cr().modify(|w| w.set_lpm_en(true));
-
-    // The EVT waits without a bound.
-    for _ in 0..1_000_000 {
-        if !d.link_status().read().link_busy() {
-            break;
-        }
-    }
-
-    h.link_cfg().modify(|w| w.set_link_rx_term_en(true));
-    h.link_int_ctrl().write(|w| {
-        w.set_link_ie_tx_lmp(true);
-        w.set_link_ie_rx_lmp(true);
-        w.set_link_ie_rx_lmp_tout(true);
-        w.set_link_ie_state_chg(true);
-        w.set_link_ie_warm_rst(true);
-    });
-    h.link_ctrl().write(|w| w.set_link_pd_mode(PdMode::P2));
-    h.link_itp_pre().write(|w| w.set_itp_pre(122));
-    h.link_tx_route().write_value(0);
-    h.usbss_ctrl().modify(|w| w.set_force_rst(true));
-
-    // Also releases FORCE_RST.
-    h.usbss_ctrl().write(|w| {
-        w.set_host_mode(true);
-        w.set_itp_en(true);
-        w.set_dma_en(true);
-        w.set_reg_hp_pend(2);
-        w.set_uhie_erdy(true);
-    });
-    h.uh_tx_ctrl().write(|_| {});
-    h.status().write(|w| {
-        w.set_uif_transfer(true);
-        w.set_uhif_erdy(true);
-    });
-
-    // Host mode uses the device view's endpoint enables.
-    d.uep_tx_en().write(|w| w.set_ep_tx_en(0, true));
-    d.uep_rx_en().write(|w| w.set_ep_rx_en(0, true));
-
-    regs::Regs(d).phy_tuning();
-}
-
-/// GLOBAL interrupt in host mode: records ERDYs and wakes the task of the
-/// completed transaction, which acknowledges it.
-pub(super) unsafe fn on_interrupt<T: Instance>() {
-    let h = T::host();
-    let state = state::<T>();
-    let status = h.status().read();
-
-    if status.uhif_erdy() {
-        let host_status = h.host_status().read();
-        h.status().write(|w| w.set_uhif_erdy(true));
-        let bit = erdy_bit(host_status.uh_rx_erdy_ep(), host_status.uh_rx_erdy_dir());
-        state.erdy.fetch_or(1 << bit, Ordering::AcqRel);
-        state.erdy_wakers[bit].wake();
-    }
-
-    if status.uif_transfer() && h.usbss_ctrl().read().uie_transfer() {
-        h.usbss_ctrl().modify(|w| w.set_uie_transfer(false));
-        state.done.wake();
-    }
-}
-
-/// LINK interrupt in host mode. A downstream port sends PORT_CAP and answers
-/// the device's PORT_CAP with PORT_CFG; PORT_CFG_RES means training completed.
-pub(super) unsafe fn on_link_interrupt<T: Instance>() {
-    let h = T::host();
-    let flags = h.link_int_flag().read();
-
-    if flags.link_if_state_chg() {
-        h.link_int_flag().write(|w| w.set_link_if_state_chg(true));
-        match h.link_status().read().link_state() {
-            // Release the forced state so the LTSSM re-detects.
-            LinkState::DISABLED => h.link_ctrl().modify(|w| w.set_link_go_disabled(false)),
-            LinkState::RXDET | LinkState::INACTIVE => port_lost::<T>(),
-            LinkState::HOTRST => {
-                h.link_ctrl()
-                    .modify(|w| w.set_link_tx_ts_cfg(w.link_tx_ts_cfg() & !regs::LINK_HOT_RESET));
-            }
-            _ => {}
-        }
-    }
-
-    if flags.link_if_tx_lmp() {
-        h.link_int_flag().write(|w| w.set_link_if_tx_lmp(true));
-        h.link_lmp_tx_data(0).write_value(LMP_LINK_SPEED | LMP_PORT_CAP);
-        h.link_lmp_tx_data(1).write_value(DOWN_STREAM | NUM_HP_BUF);
-        h.link_lmp_tx_data(2).write_value(0);
-    }
-
-    if flags.link_if_rx_lmp() {
-        h.link_int_flag().write(|w| w.set_link_if_rx_lmp(true));
-        match h.link_lmp_rx_data(0).read() & LMP_SUBTYPE_MASK {
-            LMP_PORT_CAP => {
-                h.link_lmp_tx_data(0).write_value(LMP_LINK_SPEED | LMP_PORT_CFG);
-                h.link_lmp_tx_data(1).write_value(0);
-                h.link_lmp_tx_data(2).write_value(0);
-            }
-            LMP_PORT_CFG_RES => {
-                h.link_lmp_port_cap().modify(|w| w.set_link_lmp_tx_cap_vld(true));
-                state::<T>().connected.store(true, Ordering::Release);
-            }
-            _ => {}
-        }
-    }
-
-    if flags.link_if_rx_lmp_tout() {
-        h.link_int_flag().write(|w| w.set_link_if_rx_lmp_tout(true));
-        h.link_ctrl().modify(|w| {
-            w.set_link_go_disabled(true);
-            w.set_link_go_rx_det(true);
-        });
-    }
-
-    if flags.link_if_warm_rst() {
-        h.link_int_flag().write(|w| w.set_link_if_warm_rst(true));
-        if h.link_status().read().link_rx_warm_rst() {
-            init::<T>();
-        }
-    }
-
-    state::<T>().port_waker.wake();
 }
 
 /// Root-port link status snapshot (`LINK_STATUS`, RM §27.2.6.5).
@@ -322,12 +320,12 @@ impl<'d, T: Instance> HostDriver<'d, T> {
         _irqs: impl Binding<T::Interrupt, InterruptHandler<T>> + Binding<T::LinkInterrupt, LinkInterruptHandler<T>> + 'd,
         memory: &'d mut [u8],
     ) -> Result<Self, Error> {
-        let bounce = dma_memory(memory, MAX_PACKET)?;
-        state::<T>().bounce.store(bounce, Ordering::Relaxed);
-
+        let state = state::<T>();
+        state.bounce.store(dma_memory(memory, MAX_PACKET)?, Ordering::Relaxed);
+        T::state().mode.store(MODE_HOST, Ordering::Relaxed);
+        unsafe { init_clocks::<T>() };
+        state.init();
         unsafe {
-            init_clocks::<T>();
-            init::<T>();
             T::Interrupt::unpend();
             T::LinkInterrupt::unpend();
             T::Interrupt::enable();
@@ -343,7 +341,7 @@ impl<'d, T: Instance> HostDriver<'d, T> {
 
     /// Root-port link status.
     pub fn status(&self) -> LinkStatus {
-        let status = T::host().link_status().read();
+        let status = state::<T>().regs.link_status().read();
         LinkStatus {
             state: status.link_state(),
             term_present: status.link_rx_term_pres(),
@@ -354,16 +352,16 @@ impl<'d, T: Instance> HostDriver<'d, T> {
         }
     }
 
-    /// Warm-resets the port and waits for the link to
-    /// train again. Returns whether it did.
+    /// Warm-resets the port and waits for the link to train again. Returns
+    /// whether it did.
     async fn reset(&mut self) -> bool {
         let state = state::<T>();
-        let h = T::host();
-        port_lost::<T>();
+        let h = state.regs.host();
+        state.port_lost();
 
         h.link_ctrl().write(|w| w.set_link_pd_mode(PdMode::P2));
         h.link_ctrl().modify(|w| w.set_link_tx_warm_rst(true));
-        let signalling = OnDrop::new(|| T::host().link_ctrl().modify(|w| w.set_link_tx_warm_rst(false)));
+        let signalling = OnDrop::new(|| h.link_ctrl().modify(|w| w.set_link_tx_warm_rst(false)));
         Timer::after(WARM_RESET).await;
         drop(signalling);
 
@@ -411,7 +409,7 @@ impl<'d, T: Instance> UsbHostController<'d> for HostDriver<'d, T> {
             // A link in SS.Inactive leaves it only through a Warm Reset.
             poll_fn(|cx| {
                 state.port_waker.register(cx.waker());
-                let inactive = T::host().link_status().read().link_state() == LinkState::INACTIVE;
+                let inactive = state.regs.link_status().read().link_state() == LinkState::INACTIVE;
                 if state.connected.load(Ordering::Acquire) || inactive {
                     Poll::Ready(())
                 } else {
@@ -466,14 +464,15 @@ impl<'d, T: Instance> UsbHostAllocator<'d> for Allocator<'d, T> {
         if !(1..=MAX_PACKET).contains(&max_packet_size) {
             return Err(HostError::InvalidDescriptor);
         }
+        let state = state::<T>();
         Ok(Pipe {
             channel: Channel {
+                state,
                 address,
                 endpoint: endpoint.addr.index() as u8,
                 max_packet_size,
                 seq: 0,
-                generation: state::<T>().generation.load(Ordering::Acquire),
-                _phantom: PhantomData,
+                generation: state.generation.load(Ordering::Acquire),
             },
             timeout: TimeoutConfig::default(),
             _phantom: PhantomData,
@@ -490,26 +489,26 @@ enum Packet<'a> {
 
 /// A pipe of [`HostDriver`].
 pub struct Pipe<'d, T: Instance, E, D> {
-    channel: Channel<T>,
+    channel: Channel,
     timeout: TimeoutConfig,
     _phantom: PhantomData<(&'d T, E, D)>,
 }
 
-/// The endpoint state of a pipe. Not generic over the pipe type, so the
-/// transfer code exists once.
-struct Channel<T: Instance> {
+/// The endpoint state of a pipe. Not generic, so the transfer code exists
+/// once.
+struct Channel {
+    state: &'static State,
     address: u8,
     endpoint: u8,
     max_packet_size: usize,
     /// Sequence number of the next data packet.
     seq: u8,
     generation: u32,
-    _phantom: PhantomData<T>,
 }
 
-impl<T: Instance> Channel<T> {
+impl Channel {
     fn check(&self) -> Result<(), PipeError> {
-        let state = state::<T>();
+        let state = self.state;
         if state.connected.load(Ordering::Acquire) && state.generation.load(Ordering::Acquire) == self.generation {
             Ok(())
         } else {
@@ -519,8 +518,9 @@ impl<T: Instance> Channel<T> {
 
     /// Points the controller at the pipe's device.
     fn select(&self) {
-        let h = T::host();
+        let h = self.state.regs.host();
         if h.usbss_ctrl().read().dev_addr() != self.address {
+            // The interrupt handler also modifies `USBSS_CTRL`.
             critical_section::with(|_| h.usbss_ctrl().modify(|w| w.set_dev_addr(self.address)));
         }
     }
@@ -536,8 +536,8 @@ impl<T: Instance> Channel<T> {
 
     async fn wait_done(&self, incoming: bool) -> Result<(), PipeError> {
         poll_fn(|cx| {
-            let h = T::host();
-            state::<T>().done.register(cx.waker());
+            let h = self.state.regs.host();
+            self.state.done.register(cx.waker());
             let done = if incoming {
                 h.uh_rx_ctrl().read().uh_rx_act()
             } else {
@@ -556,7 +556,7 @@ impl<T: Instance> Channel<T> {
     }
 
     async fn wait_erdy(&self, incoming: bool) -> Result<(), PipeError> {
-        let state = state::<T>();
+        let state = self.state;
         let mask = self.erdy_mask(incoming);
         poll_fn(|cx| {
             for (bit, waker) in state.erdy_wakers.iter().enumerate() {
@@ -578,8 +578,8 @@ impl<T: Instance> Channel<T> {
     /// Runs one OUT transaction. Returns `HTX_RES` and the `NumP` of the
     /// device's ACK.
     async fn transmit(&self, packet: Packet<'_>) -> Result<(u8, u8), PipeError> {
-        let state = state::<T>();
-        let h = T::host();
+        let state = self.state;
+        let h = state.regs.host();
         let _engine = state.engine.lock().await;
         self.check()?;
         self.select();
@@ -593,7 +593,7 @@ impl<T: Instance> Channel<T> {
         let address = if dma_capable(data) {
             data.as_ptr() as usize
         } else {
-            let bounce = bounce::<T>();
+            let bounce = state.bounce();
             unsafe { bounce.write(data) };
             bounce.address
         };
@@ -615,7 +615,7 @@ impl<T: Instance> Channel<T> {
             }
             w.set_uh_tx_len(data.len() as u16);
         });
-        let _armed = OnDrop::new(|| disarm::<T>(false));
+        let _armed = OnDrop::new(|| state.disarm(false));
         h.uh_tx_ctrl().modify(|w| w.set_uh_tx_res(ARM));
 
         self.wait_done(false).await?;
@@ -628,8 +628,8 @@ impl<T: Instance> Channel<T> {
     /// otherwise than with data. Returns that answer, the packets received
     /// and their length.
     async fn receive(&self, buf: &mut [u8]) -> Result<(u8, usize, usize), PipeError> {
-        let state = state::<T>();
-        let h = T::host();
+        let state = self.state;
+        let h = state.regs.host();
         let _engine = state.engine.lock().await;
         self.check()?;
         self.select();
@@ -643,7 +643,7 @@ impl<T: Instance> Channel<T> {
         let (address, packets) = if direct {
             (buf.as_mut_ptr() as usize, packets)
         } else {
-            (bounce::<T>().address, 1)
+            (state.bounce().address, 1)
         };
         h.uh_rx_dma().write(|w| w.set_uh_rx_dma(address as u32));
         h.host_rx_nump().write(|w| w.set_uh_rx_nump(packets as u8));
@@ -652,7 +652,7 @@ impl<T: Instance> Channel<T> {
             w.set_uh_rx_seq(self.seq);
             w.set_uh_rx_nump(1);
         });
-        let _armed = OnDrop::new(|| disarm::<T>(true));
+        let _armed = OnDrop::new(|| state.disarm(true));
         h.uh_rx_ctrl().modify(|w| w.set_uh_rx_res(ARM));
 
         self.wait_done(true).await?;
@@ -671,7 +671,7 @@ impl<T: Instance> Channel<T> {
             if length > buf.len() {
                 return Err(PipeError::BufferOverflow);
             }
-            unsafe { bounce::<T>().read(&mut buf[..length]) };
+            unsafe { state.bounce().read(&mut buf[..length]) };
         }
         Ok((result, received, length))
     }

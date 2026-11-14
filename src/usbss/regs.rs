@@ -5,12 +5,16 @@ use core::ops::Deref;
 use super::device::ENDPOINTS;
 use super::{LMP_LINK_SPEED, LMP_PORT_CAP, LMP_PORT_CFG_RES, NUM_HP_BUF};
 use crate::pac::usbss::vals::{Ep0RxRes, Ep0TxRes, PdMode, TxDeemph};
+#[cfg(feature = "embassy")]
+use crate::pac::usbss::UsbssHost;
 use crate::pac::usbss::{regs, EpRx, EpTx, UsbssDevice};
 
 /// Hot Reset bit of `LINK_CTRL.LINK_TX_TS_CFG`.
 pub(super) const LINK_HOT_RESET: u8 = 1;
 const UP_STREAM: u32 = 2 << 16;
 
+/// The register block through its device view. The link layer is the same in
+/// both modes, so the host driver uses it too.
 #[derive(Clone, Copy)]
 pub(super) struct Regs(pub UsbssDevice);
 
@@ -23,6 +27,11 @@ impl Deref for Regs {
 }
 
 impl Regs {
+    #[cfg(feature = "embassy")]
+    pub fn host(self) -> UsbssHost {
+        unsafe { UsbssHost::from_ptr(self.0.as_ptr()) }
+    }
+
     /// IN registers of endpoint `n` (1..=7).
     pub fn tx(self, n: usize) -> EpTx {
         self.ep_tx(n - 1)
