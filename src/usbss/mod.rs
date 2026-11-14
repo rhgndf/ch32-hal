@@ -19,7 +19,7 @@
 //! separate from `usbhs`.
 
 use core::marker::PhantomData;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{fence, AtomicU8, Ordering};
 
 use crate::pac::rcc::vals::UsbsspllRefsel;
 use crate::pac::usbss::UsbssDevice;
@@ -35,7 +35,7 @@ pub mod host;
 mod regs;
 
 pub use control::ControlPipe;
-pub use device::{Bus, Driver, Error};
+pub use device::{Bus, Driver};
 pub use endpoint::Endpoint;
 
 pub use crate::pac::usbss::vals::LinkState;
@@ -53,7 +53,61 @@ const LMP_PORT_CFG: u32 = 0x5 << 5;
 const LMP_PORT_CFG_RES: u32 = 0x6 << 5;
 const LMP_LINK_SPEED: u32 = 1 << 9;
 const NUM_HP_BUF: u32 = 4;
-const UP_STREAM: u32 = 2 << 16;
+
+const EP0_SIZE: usize = 512;
+
+/// Why a driver rejected its memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum Error {
+    InvalidMemory,
+    BufferTooSmall,
+}
+
+/// Driver-owned DMA memory.
+#[derive(Clone, Copy)]
+struct Buffer {
+    address: usize,
+}
+
+impl Buffer {
+    unsafe fn read(self, target: &mut [u8]) {
+        fence(Ordering::Acquire);
+        core::ptr::copy_nonoverlapping(self.address as *const u8, target.as_mut_ptr(), target.len());
+    }
+
+    unsafe fn write(self, source: &[u8]) {
+        core::ptr::copy_nonoverlapping(source.as_ptr(), self.address as *mut u8, source.len());
+        fence(Ordering::Release);
+    }
+}
+
+/// The RAM the controller can reach: ITCM at `0x200A_0000` through the end
+/// of the shared SRAM.
+fn dma_range(address: usize, length: usize) -> bool {
+    const RAM_START: usize = 0x200A_0000;
+    const RAM_END: usize = 0x2018_0000;
+    address >= RAM_START && address.checked_add(length).is_some_and(|end| end <= RAM_END)
+}
+
+/// Whether the controller can DMA straight to or from `buffer`. Any byte
+/// alignment works.
+fn dma_capable(buffer: &[u8]) -> bool {
+    !buffer.is_empty() && dma_range(buffer.as_ptr() as usize, buffer.len())
+}
+
+/// Start of `size` bytes of `memory`, aligned to 4.
+fn dma_memory(memory: &mut [u8], size: usize) -> Result<usize, Error> {
+    let address = memory.as_mut_ptr() as usize;
+    if !dma_range(address, memory.len()) {
+        return Err(Error::InvalidMemory);
+    }
+    let aligned = (address + 3) & !3;
+    if memory.len().saturating_sub(aligned - address) < size {
+        return Err(Error::BufferTooSmall);
+    }
+    Ok(aligned)
+}
 
 struct State {
     mode: AtomicU8,

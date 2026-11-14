@@ -3,12 +3,13 @@
 use core::ops::Deref;
 
 use super::device::ENDPOINTS;
-use super::{LMP_LINK_SPEED, LMP_PORT_CAP, LMP_PORT_CFG_RES, NUM_HP_BUF, UP_STREAM};
+use super::{LMP_LINK_SPEED, LMP_PORT_CAP, LMP_PORT_CFG_RES, NUM_HP_BUF};
 use crate::pac::usbss::vals::{Ep0RxRes, Ep0TxRes, PdMode, TxDeemph};
 use crate::pac::usbss::{regs, EpRx, EpTx, UsbssDevice};
 
 /// Hot Reset bit of `LINK_CTRL.LINK_TX_TS_CFG`.
 pub(super) const LINK_HOT_RESET: u8 = 1;
+const UP_STREAM: u32 = 2 << 16;
 
 #[derive(Clone, Copy)]
 pub(super) struct Regs(pub UsbssDevice);

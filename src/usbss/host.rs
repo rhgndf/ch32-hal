@@ -22,10 +22,10 @@ use embassy_usb_driver::host::{
 };
 use embassy_usb_driver::{EndpointInfo, EndpointType, Speed};
 
-use super::device::{dma_capable, dma_range, Buffer, Error, EP0_SIZE};
 use super::{
-    init_clocks, regs, Instance, InterruptHandler, LinkInterruptHandler, LinkState, LMP_LINK_SPEED, LMP_PORT_CAP,
-    LMP_PORT_CFG, LMP_PORT_CFG_RES, LMP_SUBTYPE_MASK, MODE_HOST, NUM_HP_BUF,
+    dma_capable, dma_memory, init_clocks, regs, Buffer, Error, Instance, InterruptHandler, LinkInterruptHandler,
+    LinkState, EP0_SIZE, LMP_LINK_SPEED, LMP_PORT_CAP, LMP_PORT_CFG, LMP_PORT_CFG_RES, LMP_SUBTYPE_MASK, MODE_HOST,
+    NUM_HP_BUF,
 };
 use crate::internal::drop::OnDrop;
 use crate::interrupt::typelevel::{Binding, Interrupt};
@@ -322,15 +322,8 @@ impl<'d, T: Instance> HostDriver<'d, T> {
         _irqs: impl Binding<T::Interrupt, InterruptHandler<T>> + Binding<T::LinkInterrupt, LinkInterruptHandler<T>> + 'd,
         memory: &'d mut [u8],
     ) -> Result<Self, Error> {
-        let address = memory.as_mut_ptr() as usize;
-        if !dma_range(address, memory.len()) {
-            return Err(Error::InvalidMemory);
-        }
-        let aligned = (address + 3) & !3;
-        if memory.len().saturating_sub(aligned - address) < MAX_PACKET {
-            return Err(Error::BufferTooSmall);
-        }
-        state::<T>().bounce.store(aligned, Ordering::Relaxed);
+        let bounce = dma_memory(memory, MAX_PACKET)?;
+        state::<T>().bounce.store(bounce, Ordering::Relaxed);
 
         unsafe {
             init_clocks::<T>();
