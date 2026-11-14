@@ -13,11 +13,11 @@ use embassy_usb_driver::{
 
 use super::control::ControlPipe;
 use super::endpoint::Endpoint;
-use super::regs::{Regs, LINK_HOT_RESET};
+use super::regs::{Regs, Role};
 use super::{
-    delay_cycles, dma_memory, init_clocks, Buffer, Error, Instance, InterruptHandler, LinkInterruptHandler, LinkState,
-    EP0_SIZE, LMP_PORT_CAP, LMP_PORT_CFG, LMP_PORT_CFG_RES, LMP_SET_LINK_FUNC, LMP_SUBTYPE_MASK, LMP_U2_INACT_TOUT,
-    MODE_DEVICE,
+    delay_cycles, dma_memory, enable_interrupts, init_clocks, Buffer, Error, Instance, InterruptHandler,
+    LinkInterruptHandler, LinkState, EP0_SIZE, LMP_PORT_CAP, LMP_PORT_CFG, LMP_PORT_CFG_RES, LMP_SET_LINK_FUNC,
+    LMP_SUBTYPE_MASK, LMP_U2_INACT_TOUT, MODE_DEVICE,
 };
 use crate::interrupt::typelevel::Interrupt;
 use crate::pac::usbss::regs;
@@ -365,16 +365,13 @@ impl<T: Instance> Bus<'_, T> {
             T::state().mode.store(MODE_DEVICE, Ordering::Relaxed);
             inner.revision = revision();
             unsafe { init_clocks::<T>() };
-            inner.regs.init(inner.revision);
+            inner.regs.init(Role::Device {
+                revision: inner.revision,
+            });
             inner.powered = true;
             inner.bus_reset();
             inner.reset_seen = false;
-            T::Interrupt::unpend();
-            T::LinkInterrupt::unpend();
-            unsafe {
-                T::Interrupt::enable();
-                T::LinkInterrupt::enable();
-            }
+            unsafe { enable_interrupts::<T>() };
         });
         state::<T>().wake(true, !0);
     }
@@ -636,8 +633,7 @@ impl Inner {
                 }
                 LinkState::HOTRST => {
                     self.link_reset();
-                    r.link_ctrl()
-                        .modify(|w| w.set_link_tx_ts_cfg(w.link_tx_ts_cfg() & !LINK_HOT_RESET));
+                    r.end_hot_reset();
                 }
                 _ => {}
             }
@@ -664,7 +660,7 @@ impl Inner {
             match data0 & LMP_SUBTYPE_MASK {
                 LMP_PORT_CAP => r.tx_port_cap(),
                 LMP_PORT_CFG => r.tx_port_cfg_res(),
-                LMP_PORT_CFG_RES => r.link_lmp_port_cap().modify(|w| w.set_link_lmp_tx_cap_vld(true)),
+                LMP_PORT_CFG_RES => r.port_configured(),
                 LMP_U2_INACT_TOUT => r
                     .link_u2_inact_timer()
                     .write(|w| w.set_u2_inactive_timer((data0 >> 9) as u8)),
@@ -676,8 +672,7 @@ impl Inner {
 
         if flags.link_if_rx_lmp_tout() {
             r.link_int_flag().write(|w| w.set_link_if_rx_lmp_tout(true));
-            r.link_ctrl().modify(|w| w.set_link_go_disabled(true));
-            r.link_ctrl().modify(|w| w.set_link_go_rx_det(true));
+            r.redetect();
             return false;
         }
 

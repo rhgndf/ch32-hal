@@ -21,6 +21,7 @@
 use core::marker::PhantomData;
 use core::sync::atomic::{fence, AtomicU8, Ordering};
 
+use crate::interrupt::typelevel::Interrupt;
 use crate::pac::rcc::vals::UsbsspllRefsel;
 use crate::pac::usbss::UsbssDevice;
 use crate::{interrupt, PeripheralType, RccPeripheral};
@@ -201,6 +202,14 @@ unsafe fn init_clocks<T: Instance>() {
         w.set_pipeon(true);
         w.set_utmion(true);
     });
+}
+
+/// Unmasks both interrupts, dropping requests from before the driver started.
+unsafe fn enable_interrupts<T: Instance>() {
+    T::Interrupt::unpend();
+    T::LinkInterrupt::unpend();
+    T::Interrupt::enable();
+    T::LinkInterrupt::enable();
 }
 
 fn delay_cycles(count: u32) {

@@ -22,14 +22,14 @@ use embassy_usb_driver::host::{
 };
 use embassy_usb_driver::{EndpointInfo, EndpointType, Speed};
 
-use super::regs::{self, Regs};
+use super::regs::{Regs, Role};
 use super::{
-    dma_capable, dma_memory, init_clocks, Buffer, Error, Instance, InterruptHandler, LinkInterruptHandler, LinkState,
-    EP0_SIZE, LMP_LINK_SPEED, LMP_PORT_CAP, LMP_PORT_CFG, LMP_PORT_CFG_RES, LMP_SUBTYPE_MASK, MODE_HOST, NUM_HP_BUF,
+    dma_capable, dma_memory, enable_interrupts, init_clocks, Buffer, Error, Instance, InterruptHandler,
+    LinkInterruptHandler, LinkState, EP0_SIZE, LMP_PORT_CAP, LMP_PORT_CFG_RES, LMP_SUBTYPE_MASK, MODE_HOST,
 };
 use crate::internal::drop::OnDrop;
-use crate::interrupt::typelevel::{Binding, Interrupt};
-use crate::pac::usbss::vals::{PdMode, TxDeemph};
+use crate::interrupt::typelevel::Binding;
+use crate::pac::usbss::vals::PdMode;
 use crate::Peri;
 
 /// Largest SuperSpeed data packet.
@@ -52,7 +52,6 @@ const WARM_RESET: Duration = Duration::from_millis(80);
 const RETRAIN: Duration = Duration::from_secs(1);
 /// Delay before a Status stage, which fails otherwise.
 const STATUS_DELAY: Duration = Duration::from_millis(1);
-const DOWN_STREAM: u32 = 1 << 16;
 
 pub(super) struct State {
     regs: Regs,
@@ -113,9 +112,7 @@ impl State {
         h.status().write(|w| w.set_uif_transfer(true));
     }
 
-    /// Initializes the block as a SuperSpeed host, also on a warm reset. The
-    /// de-emphasis is the 3.5 dB of USB 3.0, where the EVT writes the reserved
-    /// value 3.
+    /// Initializes the block as a SuperSpeed host, also on a warm reset.
     fn init(&self) {
         self.port_lost();
         self.erdy.store(0, Ordering::Relaxed);
@@ -125,44 +122,7 @@ impl State {
         h.usbss_ctrl().modify(|w| w.set_usb_clr_all(false));
         h.uh_tx_ctrl().write(|_| {});
         h.uh_rx_ctrl().write(|_| {});
-
-        h.link_cfg().write(|w| {
-            w.set_link_rx_eq_en(true);
-            w.set_link_tx_deemph(TxDeemph::DB3_5);
-            w.set_link_down_mode(true);
-            w.set_link_phy_reset(true);
-        });
-        h.link_ctrl().write(|w| {
-            w.set_link_pd_mode(PdMode::P2);
-            w.set_link_go_disabled(true);
-        });
-        h.link_cfg().write(|w| {
-            w.set_link_rx_eq_en(true);
-            w.set_link_tx_deemph(TxDeemph::DB3_5);
-            w.set_link_down_mode(true);
-            w.set_link_u2_det_en(true);
-            w.set_link_ltssm_mode(true);
-        });
-        h.link_lpm_cr().modify(|w| w.set_lpm_en(true));
-
-        // The EVT waits without a bound.
-        for _ in 0..1_000_000 {
-            if !h.link_status().read().link_busy() {
-                break;
-            }
-        }
-
-        h.link_cfg().modify(|w| w.set_link_rx_term_en(true));
-        h.link_int_ctrl().write(|w| {
-            w.set_link_ie_tx_lmp(true);
-            w.set_link_ie_rx_lmp(true);
-            w.set_link_ie_rx_lmp_tout(true);
-            w.set_link_ie_state_chg(true);
-            w.set_link_ie_warm_rst(true);
-        });
-        h.link_ctrl().write(|w| w.set_link_pd_mode(PdMode::P2));
-        h.link_itp_pre().write(|w| w.set_itp_pre(122));
-        h.link_tx_route().write_value(0);
+        self.regs.init(Role::Host);
         h.usbss_ctrl().modify(|w| w.set_force_rst(true));
 
         // Also releases FORCE_RST.
@@ -182,8 +142,6 @@ impl State {
         // Host mode uses the device view's endpoint enables.
         self.regs.uep_tx_en().write(|w| w.set_ep_tx_en(0, true));
         self.regs.uep_rx_en().write(|w| w.set_ep_rx_en(0, true));
-
-        self.regs.phy_tuning();
     }
 
     /// GLOBAL interrupt in host mode: records ERDYs and wakes the task of the
@@ -220,31 +178,22 @@ impl State {
                 // Release the forced state so the LTSSM re-detects.
                 LinkState::DISABLED => r.link_ctrl().modify(|w| w.set_link_go_disabled(false)),
                 LinkState::RXDET | LinkState::INACTIVE => self.port_lost(),
-                LinkState::HOTRST => {
-                    r.link_ctrl()
-                        .modify(|w| w.set_link_tx_ts_cfg(w.link_tx_ts_cfg() & !regs::LINK_HOT_RESET));
-                }
+                LinkState::HOTRST => r.end_hot_reset(),
                 _ => {}
             }
         }
 
         if flags.link_if_tx_lmp() {
             r.link_int_flag().write(|w| w.set_link_if_tx_lmp(true));
-            r.link_lmp_tx_data(0).write_value(LMP_LINK_SPEED | LMP_PORT_CAP);
-            r.link_lmp_tx_data(1).write_value(DOWN_STREAM | NUM_HP_BUF);
-            r.link_lmp_tx_data(2).write_value(0);
+            r.tx_port_cap();
         }
 
         if flags.link_if_rx_lmp() {
             r.link_int_flag().write(|w| w.set_link_if_rx_lmp(true));
             match r.link_lmp_rx_data(0).read() & LMP_SUBTYPE_MASK {
-                LMP_PORT_CAP => {
-                    r.link_lmp_tx_data(0).write_value(LMP_LINK_SPEED | LMP_PORT_CFG);
-                    r.link_lmp_tx_data(1).write_value(0);
-                    r.link_lmp_tx_data(2).write_value(0);
-                }
+                LMP_PORT_CAP => r.tx_port_cfg(),
                 LMP_PORT_CFG_RES => {
-                    r.link_lmp_port_cap().modify(|w| w.set_link_lmp_tx_cap_vld(true));
+                    r.port_configured();
                     self.connected.store(true, Ordering::Release);
                 }
                 _ => {}
@@ -253,10 +202,7 @@ impl State {
 
         if flags.link_if_rx_lmp_tout() {
             r.link_int_flag().write(|w| w.set_link_if_rx_lmp_tout(true));
-            r.link_ctrl().modify(|w| {
-                w.set_link_go_disabled(true);
-                w.set_link_go_rx_det(true);
-            });
+            r.redetect();
         }
 
         if flags.link_if_warm_rst() {
@@ -325,12 +271,7 @@ impl<'d, T: Instance> HostDriver<'d, T> {
         T::state().mode.store(MODE_HOST, Ordering::Relaxed);
         unsafe { init_clocks::<T>() };
         state.init();
-        unsafe {
-            T::Interrupt::unpend();
-            T::LinkInterrupt::unpend();
-            T::Interrupt::enable();
-            T::LinkInterrupt::enable();
-        }
+        unsafe { enable_interrupts::<T>() };
 
         Ok(Self {
             _peri: peri,
