@@ -15,9 +15,9 @@ const IN_ABORT_SETTLE_US: u32 = 100;
 
 /// A data endpoint.
 ///
-/// Transfers DMA straight to or from the caller's buffer, which `Driver::new`
-/// lists the rules for. Dropping a transfer future aborts the transfer and
-/// loses the data in flight; for an IN transfer the drop blocks for 100 us.
+/// Transfers DMA straight to or from the caller's buffer. Dropping a transfer
+/// future aborts the transfer and loses the data in flight; for an IN transfer
+/// the drop blocks for 100 us.
 pub struct Endpoint<'d, T: Instance, const IN: bool> {
     info: EndpointInfo,
     _lifetime: PhantomData<&'d mut T>,
@@ -55,7 +55,6 @@ impl<'d, T: Instance, const IN: bool> Endpoint<'d, T, IN> {
             inner.start(slot);
             Ok(())
         })?;
-        // Aborts the transfer if the future is dropped before it completes.
         let abort = OnDrop::new(move || {
             let aborted = state::<T>().inner.lock(|inner| {
                 let mut inner = inner.borrow_mut();

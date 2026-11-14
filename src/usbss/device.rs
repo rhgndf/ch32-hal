@@ -56,7 +56,6 @@ pub enum Error {
     BufferTooSmall,
 }
 
-/// The EP0 memory.
 #[derive(Clone, Copy)]
 pub(super) struct Buffer {
     pub address: usize,
@@ -269,7 +268,7 @@ pub(super) fn dma_capable(buffer: &[u8]) -> bool {
 
 /// Silicon revision, `CHIP_ID[7:4]`.
 fn revision() -> u8 {
-    // The EVT `FLASH_BOOT_GetMode` reads flash before the ESIG area.
+    // Read flash before the ESIG area.
     unsafe { core::ptr::read_volatile(0x0800_0000 as *const u32) };
     ((crate::signature::chip_id().dev_id() >> 4) & 0xf) as u8
 }
@@ -281,14 +280,8 @@ pub struct Driver<'d, T: Instance> {
 }
 
 impl<'d, T: Instance> Driver<'d, T> {
-    /// `ep0_memory` needs 512 bytes, after aligning to 4, inside the
+    /// `ep0_memory` needs to be 512 bytes aligned to 4 bytes, inside the
     /// controller's DMA range `0x200A_0000..0x2018_0000`.
-    ///
-    /// The driver allocates no other memory: data endpoints DMA straight to
-    /// and from the transfer buffers, which must be in the DMA range too. An
-    /// OUT buffer must also hold whole packets: one for `read`, a multiple of
-    /// the packet size for `read_transfer`. Transfers on other buffers fail
-    /// with `BufferOverflow`.
     pub fn new(
         peri: Peri<'d, T>,
         _irqs: impl interrupt::typelevel::Binding<T::Interrupt, InterruptHandler<T>>
@@ -786,7 +779,6 @@ impl Inner {
     fn complete(&mut self, slot: usize) {
         if self.endpoints[slot].phase == Phase::Busy {
             self.endpoints[slot].phase = Phase::Done;
-            // EP0 waits on slot 0 for both directions.
             self.wake |= 1 << if slot < 2 { 0 } else { slot };
         }
     }
