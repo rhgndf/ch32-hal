@@ -254,7 +254,7 @@ fn packet_size_valid(kind: EndpointType, size: u16, interval: u8) -> bool {
 }
 
 /// ITCM at `0x200A_0000` through the end of the shared SRAM.
-fn dma_range(address: usize, length: usize) -> bool {
+pub(super) fn dma_range(address: usize, length: usize) -> bool {
     const RAM_START: usize = 0x200A_0000;
     const RAM_END: usize = 0x2018_0000;
     address >= RAM_START && address.checked_add(length).is_some_and(|end| end <= RAM_END)
